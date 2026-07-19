@@ -1,0 +1,28 @@
+# One-command local stack:  docker compose up --build
+# API on http://localhost:3000 — dev OTP codes are echoed in the /auth/otp/request response.
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: runverse
+      POSTGRES_PASSWORD: runverse
+      POSTGRES_DB: runverse
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U runverse"], interval: 3s, retries: 15 }
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 3s, retries: 15 }
+  api:
+    build: .
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgres://runverse:runverse@db:5432/runverse
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: development           # keeps dev OTP echo on; set production + JWT_SECRET to disable
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+volumes:
+  pgdata:

@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "RUNVERSE",
+    "slug": "runverse",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0b0e14",
+    "android": {
+      "package": "app.runverse.dev",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION"
+      ]
+    },
+    "ios": {
+      "bundleIdentifier": "app.runverse.dev",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "RUNVERSE records your route during a run to convert it into territory."
+      }
+    },
+    "plugins": [
+      "@maplibre/maplibre-react-native",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "RUNVERSE records your route during a run to convert it into territory.",
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ]
+    ]
+  }
+}

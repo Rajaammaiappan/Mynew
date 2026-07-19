@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>RUNVERSE — Test Client</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  :root { --bg:#0b0e14; --panel:#131824; --line:#232b3d; --txt:#e6ecff; --mut:#8b96b3; --acc:#00e5ff; --ok:#69f0ae; --warn:#ffb300; --bad:#ff3b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,Segoe UI,sans-serif; background:var(--bg); color:var(--txt); display:flex; height:100vh; }
+  #panel { width:340px; min-width:340px; background:var(--panel); border-right:1px solid var(--line); padding:14px; overflow-y:auto; }
+  #map { flex:1; background:#000; }
+  h1 { font-size:16px; margin:0 0 4px; letter-spacing:.06em; } h1 span { color:var(--acc); }
+  .sub { color:var(--mut); font-size:12px; margin-bottom:14px; }
+  label { display:block; font-size:11px; color:var(--mut); margin:10px 0 3px; text-transform:uppercase; letter-spacing:.08em; }
+  input { width:100%; padding:8px 10px; background:#0b0e14; border:1px solid var(--line); border-radius:8px; color:var(--txt); }
+  button { width:100%; margin-top:10px; padding:10px; border:0; border-radius:8px; background:var(--acc); color:#00222a; font-weight:700; cursor:pointer; }
+  button.secondary { background:#1d2436; color:var(--txt); }
+  button.danger { background:var(--bad); color:#fff; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  #log { margin-top:14px; background:#0b0e14; border:1px solid var(--line); border-radius:8px; padding:10px; font:12px/1.5 ui-monospace,Consolas,monospace; height:220px; overflow-y:auto; white-space:pre-wrap; }
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)} .dim{color:var(--mut)}
+  #stats { display:flex; gap:8px; margin-top:12px; }
+  .stat { flex:1; background:#0b0e14; border:1px solid var(--line); border-radius:8px; padding:8px; text-align:center; }
+  .stat b { display:block; font-size:18px; color:var(--acc); } .stat span { font-size:10px; color:var(--mut); text-transform:uppercase; }
+  .hint { font-size:11px; color:var(--mut); margin-top:8px; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>RUN<span>VERSE</span> test client</h1>
+  <div class="sub">Dev tool — simulates GPS runs against your deployed API and renders captured territory live.</div>
+
+  <label>API base URL</label>
+  <input id="apiUrl" value="http://localhost:3000" />
+  <label>Phone (any E.164 — dev OTP is automatic)</label>
+  <input id="phone" value="+919000000100" />
+  <button id="loginBtn">1 · Login</button>
+
+  <label style="margin-top:16px">Simulated run (drops at map center)</label>
+  <button id="runBtn" class="secondary" disabled>2 · Run a 2 km loop here 🏃</button>
+  <button id="bigBtn" class="secondary" disabled>Run a 5 km loop (more hexes)</button>
+  <button id="cheatBtn" class="danger" disabled>3 · Try to cheat (60 km/h "run") 🚗</button>
+
+  <label style="margin-top:16px">Real run (this device's GPS — needs HTTPS)</label>
+  <button id="gpsBtn" class="secondary" disabled>📍 Record real run</button>
+
+  <div id="stats">
+    <div class="stat"><b id="stHex">0</b><span>my hexes</span></div>
+    <div class="stat"><b id="stClaim">0</b><span>last claim</span></div>
+    <div class="stat"><b id="stSteal">0</b><span>last steal</span></div>
+  </div>
+  <div class="hint">Pan the map anywhere on Earth, then run. Log in with a second phone number in another tab to fight over territory (fresh hexes defend; they decay −8 strength/day).</div>
+  <div id="log"></div>
+</div>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (msg, cls='') => { const d=$('log'); d.innerHTML += `<span class="${cls}">${msg}</span>\n`; d.scrollTop = d.scrollHeight; };
+const api = () => $('apiUrl').value.replace(/\/$/,'') + '/v1';
+
+let token = null, me = null, ws = null;
+const hexLayers = new Map();   // h3 -> leaflet polygon
+const map = L.map('map', { zoomControl: true }).setView([12.9716, 77.5946], 14); // Bengaluru
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  { attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 19 }).addTo(map);
+
+async function call(path, opts={}) {
+  const res = await fetch(api()+path, { ...opts,
+    headers: { 'content-type':'application/json', ...(token?{authorization:'Bearer '+token}:{}), ...(opts.headers||{}) } });
+  if (res.status === 204) return null;
+  const body = await res.json().catch(()=>null);
+  if (!res.ok) throw new Error(`${res.status} ${body?.code||''} ${body?.detail||body?.message||''}`);
+  return body;
+}
+
+function drawHex(h3, color, strength, mineNow) {
+  const boundary = h3.cellToBoundary(h3);            // [[lat,lng],...]
+  const old = hexLayers.get(h3); if (old) map.removeLayer(old);
+  const poly = L.polygon(boundary, {
+    color, weight: 1.5, fillColor: color, fillOpacity: Math.max(.12, .45 * (strength/100)),
+  }).addTo(map);
+  poly.bindTooltip(`${h3}<br>strength ${strength}${mineNow?' · yours':''}`);
+  hexLayers.set(h3, poly);
+}
+
+async function refreshViewport() {
+  const c = map.getCenter();
+  const r5 = h3.cellToParent(h3.latLngToCell(c.lat, c.lng, 9), 5);
+  const ring = h3.gridDisk(r5, 1).slice(0, 6);
+  const data = await call('/territory/viewport?cells=' + ring.join(','));
+  let mine = 0;
+  for (const h of data.hexes) {
+    const isMine = me && h.owner.id === me.id; if (isMine) mine++;
+    drawHex(h.h3, h.owner.color, h.strength_eff, isMine);
+  }
+  $('stHex').textContent = mine;
+  log(`viewport: ${data.hexes.length} owned hexes in view`, 'dim');
+}
+
+function connectWs() {
+  const base = $('apiUrl').value.replace(/\/$/,'').replace(/^http/,'ws');
+  ws = new WebSocket(`${base}/rt?token=${token}`);
+  ws.onopen = () => {
+    const c = map.getCenter();
+    const r5 = h3.cellToParent(h3.latLngToCell(c.lat, c.lng, 9), 5);
+    ws.send(JSON.stringify({ type:'subscribe', cells_r5: h3.gridDisk(r5, 1).slice(0,6) }));
+    log('live map connected (WebSocket)', 'ok');
+  };
+  ws.onmessage = (m) => {
+    const e = JSON.parse(m.data);
+    if (e.type === 'territory.delta') {
+      for (const ch of e.changes) drawHex(ch.h3, ch.owner.color, ch.strength, me && ch.owner.id === me.id);
+      log(`⚡ live delta: ${e.changes.length} hex(es) changed`, 'warn');
+    }
+    if (e.type === 'activity.result') {
+      $('stClaim').textContent = e.hexes_claimed; $('stSteal').textContent = e.hexes_stolen;
+      log(`result: +${e.hexes_claimed} claimed, ${e.hexes_stolen} stolen, ${e.hexes_refreshed} refreshed`, 'ok');
+      refreshViewport().catch(err=>log(err.message,'bad'));
+    }
+  };
+  ws.onclose = () => log('live map disconnected', 'dim');
+}
+
+$('loginBtn').onclick = async () => {
+  try {
+    const phone = $('phone').value.trim();
+    const req = await call('/auth/otp/request', { method:'POST', body: JSON.stringify({ phone_e164: phone }) });
+    if (!req.dev_code) return log('No dev_code in response — server is in production mode; enter OTP manually via curl.', 'bad');
+    const v = await call('/auth/otp/verify', { method:'POST',
+      body: JSON.stringify({ phone_e164: phone, code: req.dev_code, device: { platform:'dev' } }) });
+    token = v.access; me = v.user;
+    log(`logged in as @${me.handle} ${v.is_new?'(new account)':''}`, 'ok');
+    ['runBtn','bigBtn','cheatBtn','gpsBtn'].forEach(id => $(id).disabled = false);
+    connectWs();
+    await refreshViewport();
+  } catch (e) { log('login failed: ' + e.message, 'bad'); }
+};
+
+function makeLoop(lat0, lng0, radiusM, speedMs) {
+  const mLat = 111320, mLng = 111320 * Math.cos(lat0 * Math.PI/180);
+  const circ = 2 * Math.PI * radiusM, n = Math.round(circ / speedMs); // 1 point/sec
+  const t0 = Date.now() - n * 1000, pts = [];
+  for (let i = 0; i <= n; i++) {
+    const a = (i / n) * 2 * Math.PI * (1 - 20 / circ);
+    pts.push({ t: t0 + i*1000,
+      lat: lat0 + (radiusM * Math.sin(a)) / mLat,
+      lng: lng0 + (radiusM * Math.cos(a)) / mLng, acc: 8 });
+  }
+  return pts;
+}
+
+async function simulate(radiusM, speedMs, sensors, label) {
+  try {
+    const c = map.getCenter();
+    const pts = makeLoop(c.lat, c.lng, radiusM, speedMs);
+    log(`${label}: ${(2*Math.PI*radiusM/1000).toFixed(1)} km loop @ ${(speedMs*3.6).toFixed(0)} km/h, ${pts.length} GPS points…`);
+    const s = await call('/activities/live/start', { method:'POST',
+      body: JSON.stringify({ type:'run', started_at: new Date(pts[0].t).toISOString() }) });
+    for (let seq = 0; seq*200 < pts.length; seq++) {
+      await call(`/activities/live/${s.activity_id}/chunks`, { method:'POST',
+        body: JSON.stringify({ seq, points: pts.slice(seq*200,(seq+1)*200), sensors }) });
+    }
+    const fin = await call(`/activities/live/${s.activity_id}/finish`, { method:'POST',
+      body: JSON.stringify({ ended_at: new Date(pts[pts.length-1].t).toISOString() }) });
+    log(`uploaded → pipeline ${fin.status}; waiting for verdict…`, 'dim');
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r=>setTimeout(r, 400));
+      const res = await call(`/activities/${s.activity_id}/result`);
+      if (res.status === 'flagged') return log(`🚫 FLAGGED (${JSON.stringify(res.validation_flags)}) — zero territory, sent to fraud review`, 'bad');
+      if (res.status === 'rejected') return log(`rejected: ${JSON.stringify(res.validation_flags)}`, 'bad');
+      if (res.pipeline_stage === 'fanned_out') return; // WS frame updates the UI
+    }
+    log('pipeline still busy — check server logs', 'warn');
+  } catch (e) { log('simulate failed: ' + e.message, 'bad'); }
+}
+
+$('runBtn').onclick  = () => simulate(320, 3.1, { steps: 2800, accelVar: 1.1 }, 'honest run');
+$('bigBtn').onclick  = () => simulate(800, 3.3, { steps: 7000, accelVar: 1.1 }, 'honest long run');
+$('cheatBtn').onclick= () => simulate(800, 17,  { steps: 25, accelVar: 0.02 }, '🚗 cheat attempt');
+// ---- real GPS recording (phone) ----
+let gps = null; // { watchId, actId, seq, buf, timer, wakeLock, count }
+$('gpsBtn').onclick = async () => {
+  if (gps) return stopGps();
+  if (!navigator.geolocation) return log('geolocation unavailable in this browser', 'bad');
+  try {
+    const s = await call('/activities/live/start', { method:'POST',
+      body: JSON.stringify({ type:'run', started_at: new Date().toISOString() }) });
+    gps = { actId: s.activity_id, seq: 0, buf: [], count: 0, watchId: null, timer: null, wakeLock: null };
+    try { gps.wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    gps.watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        gps.buf.push({ t: pos.timestamp, lat: pos.coords.latitude, lng: pos.coords.longitude,
+                       acc: pos.coords.accuracy ?? undefined });
+        gps.count++;
+        if (gps.count % 10 === 0) log(`recording… ${gps.count} GPS points`, 'dim');
+        map.setView([pos.coords.latitude, pos.coords.longitude]);
+      },
+      (err) => log('GPS error: ' + err.message, 'bad'),
+      { enableHighAccuracy: true, maximumAge: 0 });
+    gps.timer = setInterval(flushGps, 15000);
+    $('gpsBtn').textContent = '⏹ Finish real run';
+    log('real GPS recording started — go run! (screen must stay on)', 'ok');
+  } catch (e) { log('start failed: ' + e.message, 'bad'); gps = null; }
+};
+async function flushGps() {
+  if (!gps || gps.buf.length === 0) return;
+  const points = gps.buf.splice(0, 200), seq = gps.seq++;
+  try { await call(`/activities/live/${gps.actId}/chunks`, { method:'POST', body: JSON.stringify({ seq, points }) }); }
+  catch { gps.buf.unshift(...points); gps.seq = seq; }
+}
+async function stopGps() {
+  const g = gps; gps = null;
+  $('gpsBtn').textContent = '📍 Record real run';
+  navigator.geolocation.clearWatch(g.watchId); clearInterval(g.timer);
+  try { g.wakeLock?.release(); } catch {}
+  while (g.buf.length) { gps = g; await flushGps(); gps = null; }
+  if (g.count < 5) {
+    await call(`/activities/live/${g.actId}/abandon`, { method:'POST' }).catch(()=>{});
+    return log('too few points — run discarded', 'warn');
+  }
+  await call(`/activities/live/${g.actId}/finish`, { method:'POST',
+    body: JSON.stringify({ ended_at: new Date().toISOString() }) });
+  log(`real run uploaded (${g.count} points) — waiting for verdict…`, 'dim');
+}
+map.on('moveend', () => { if (token) refreshViewport().catch(()=>{}); });
+</script>
+</body>
+</html>
